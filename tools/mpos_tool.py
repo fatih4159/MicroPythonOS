@@ -154,21 +154,31 @@ def _fix_patch_targets(patch_file: Path, workdir: Path) -> int:
     return fixed
 
 
+def _is_windows_fs(repo_root: Path) -> bool:
+    """Return True when the repo lives on a Windows NTFS filesystem.
+
+    This covers both native Windows Python and WSL paths (/mnt/c/…, /mnt/d/…).
+    """
+    return _OS == "Windows" or str(repo_root).startswith("/mnt/")
+
+
 def _fix_crlf(repo_root: Path) -> int:
     """
-    Strip Windows carriage returns (\\r) from shell scripts, patch files, and
-    the C/H source files those patches target.  Returns the count of files
-    that were actually modified.
+    Strip Windows carriage returns (\\r) from shell scripts, patch files,
+    the C/H source files those patches target, and — on Windows filesystems —
+    the ESP-IDF submodule's shell scripts.  Returns the count of files that
+    were actually modified.
 
     This is necessary when the repository lives on a Windows NTFS filesystem
     (e.g. /mnt/c/… in WSL): git on Windows checks out text files with CRLF
     line endings.  Shell scripts with CRLF can't be executed by bash; patch
     files with CRLF cause 'different line endings' hunk failures when their
-    target C files also have CRLF.
+    target C files also have CRLF.  ESP-IDF's own install/export scripts fail
+    with '/usr/bin/env: bash\\r: No such file or directory'.
     """
     fixed = 0
 
-    # ── Shell scripts ────────────────────────────────────────────────────────
+    # ── Shell scripts in scripts/ ────────────────────────────────────────────
     for p in (repo_root / "scripts").glob("*.sh"):
         fixed += _strip_file(p)
 
@@ -179,6 +189,22 @@ def _fix_crlf(repo_root: Path) -> int:
         workdir = _PATCH_WORKDIRS.get(patch_file.name)
         if workdir and workdir.is_dir():
             fixed += _fix_patch_targets(patch_file, workdir)
+
+    # ── ESP-IDF + submodule shell scripts (Windows NTFS only) ────────────────
+    # git on Windows checks out ALL text files with CRLF, including every .sh
+    # inside lvgl_micropython/lib/esp-idf and lvgl_micropython/lib/micropython.
+    # We use esp-idf/install.sh as a canary: if it still has CRLF we do a full
+    # recursive sweep; subsequent builds are O(1) because the canary is clean.
+    if _is_windows_fs(repo_root):
+        canary = lvgl_dir / "lib" / "esp-idf" / "install.sh"
+        lib_dir = lvgl_dir / "lib"
+        if canary.exists() and lib_dir.is_dir():
+            try:
+                if b"\r" in canary.read_bytes():
+                    for p in lib_dir.rglob("*.sh"):
+                        fixed += _strip_file(p)
+            except OSError:
+                pass
 
     return fixed
 
@@ -627,6 +653,13 @@ class MposTool(App[None]):
         if rc == 0:
             self._ok(f"Build finished in {elapsed:.0f}s.")
             self._refresh_ports_and_fw()
+            if not find_firmware_files():
+                self._error(
+                    "Build exited 0 but no firmware file was found. "
+                    "Check the log above for ESP-IDF setup errors "
+                    "(e.g. '/usr/bin/env: bash\\r: No such file or directory'). "
+                    "Run the build again — CRLF in ESP-IDF scripts has now been fixed."
+                )
         else:
             self._error(f"Build failed (exit {rc}) after {elapsed:.0f}s.")
         self._state = _S.IDLE
@@ -660,6 +693,14 @@ class MposTool(App[None]):
             return
         self._ok(f"Build finished in {elapsed:.0f}s — starting flash…")
         self._refresh_ports_and_fw()
+        if not find_firmware_files():
+            self._error(
+                "Build exited 0 but no firmware file was found. "
+                "Check the log above for ESP-IDF setup errors. "
+                "Run the build again — CRLF in ESP-IDF scripts has now been fixed."
+            )
+            self._state = _S.IDLE
+            return
 
         # ── Phase 2: Flash ────────────────────────────────────────────
         self._state = _S.FLASHING   # triggers watch__state → cyan dot + progress bar
@@ -785,12 +826,24 @@ class MposTool(App[None]):
     # ── Pre-flight checks ─────────────────────────────────────────────────────
 
     def _preflight_crlf(self) -> None:
-        """Fix CRLF line endings in scripts/ and patch targets before a build."""
+        """Fix CRLF line endings in scripts, patches, and ESP-IDF submodule before a build."""
+        # Warn the user before the sweep in case it takes a moment on NTFS
+        if _is_windows_fs(REPO_ROOT):
+            canary = LVGL_DIR / "lib" / "esp-idf" / "install.sh"
+            if canary.exists():
+                try:
+                    if b"\r" in canary.read_bytes():
+                        self._warn(
+                            "Windows filesystem detected — fixing CRLF in ESP-IDF scripts. "
+                            "This only happens once and may take a few seconds…"
+                        )
+                except OSError:
+                    pass
         n = _fix_crlf(REPO_ROOT)
         if n:
             self._warn(
-                f"Fixed CRLF→LF in {n} file(s) (scripts, patches, C sources). "
-                "(Windows filesystem detected — this is a one-time correction.)"
+                f"Fixed CRLF→LF in {n} file(s) (scripts, patches, ESP-IDF). "
+                "(One-time correction for Windows checkout.)"
             )
 
     # ── UI helpers ───────────────────────────────────────────────────────────
