@@ -308,19 +308,50 @@ def find_firmware_files() -> list[tuple[str, str]]:
     """
     Return [(label, abs_path)] for flashable .bin files.
     Merged images (address 0x0) are listed first, then individual app bins.
+
+    Searched locations (in order):
+      1. lvgl_micropython/build/*.bin           — merged images from make.py
+      2. lvgl_micropython/lib/…/esp32/build-*   — board build dirs:
+           • micropython.bin     (app-only binary)
+           • *.bin ≥ 256 KB      (merged/combined images produced in same dir)
+      3. <repo_root>/*.bin                      — output of make_image.sh
     """
     results: list[tuple[str, str]] = []
+    seen: set[str] = set()
 
+    def _add(label: str, path: Path) -> None:
+        key = str(path.resolve())
+        if key not in seen and path.is_file():
+            seen.add(key)
+            results.append((label, str(path)))
+
+    # 1 ── Merged images in lvgl_micropython/build/ ───────────────────────────
+    #      make.py writes lvgl_micropy_<BOARD>-<VARIANT>-<SIZE>.bin here
     if MERGED_BIN_DIR.is_dir():
         for p in sorted(MERGED_BIN_DIR.glob("*.bin")):
-            results.append((f"[merged]  {p.name}", str(p)))
+            _add(f"[merged]  {p.name}", p)
 
+    # 2 ── Board-specific ESP-IDF build directories ───────────────────────────
     if ESP32_BUILD.is_dir():
-        for p in sorted(ESP32_BUILD.glob("build-*/micropython.bin")):
-            results.append((f"[app]     {p.parent.name}", str(p)))
+        for build_dir in sorted(ESP32_BUILD.glob("build-*")):
+            if not build_dir.is_dir():
+                continue
+            # app-only binary (flash at 0x20000)
+            _add(f"[app]     {build_dir.name}", build_dir / "micropython.bin")
+            # merged binaries sitting directly in the build dir (≥ 256 KB to
+            # avoid bootloader.bin, partition-table.bin, etc.)
+            for p in sorted(build_dir.glob("*.bin")):
+                if p.name == "micropython.bin":
+                    continue
+                try:
+                    if p.stat().st_size >= 256 * 1024:
+                        _add(f"[merged]  {p.name}", p)
+                except OSError:
+                    pass
 
+    # 3 ── Any .bin at repo root (make_image.sh output) ───────────────────────
     for p in sorted(REPO_ROOT.glob("*.bin")):
-        results.append((f"[root]    {p.name}", str(p)))
+        _add(f"[root]    {p.name}", p)
 
     return results
 
@@ -783,9 +814,13 @@ class MposTool(App[None]):
         if files:
             fw_sel.set_options(files)
             fw_sel.value = files[0][1]
+            self._info(f"Firmware: {len(files)} file(s) found.")
         else:
             fw_sel.set_options([])
-        self._info(f"Firmware: {len(files)} file(s) found.")
+            self._warn(
+                "Firmware: 0 files found.  "
+                f"Searched: {MERGED_BIN_DIR}  |  {ESP32_BUILD / 'build-*'}  |  {REPO_ROOT / '*.bin'}"
+            )
 
     # ── Log helpers (safe to call from async workers or sync handlers) ────────
 
