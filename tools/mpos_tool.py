@@ -105,26 +105,81 @@ MERGED_BIN_DIR = LVGL_DIR / "build"
 ESP32_BUILD    = LVGL_DIR / "lib" / "micropython" / "ports" / "esp32"
 
 
-def _fix_crlf(directory: Path) -> int:
+def _strip_file(p: Path) -> int:
+    """Strip \\r from a single file. Returns 1 if modified, 0 otherwise."""
+    try:
+        raw = p.read_bytes()
+        if b"\r" in raw:
+            p.write_bytes(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+            return 1
+    except OSError:
+        pass
+    return 0
+
+
+# Map patch filename → working directory used when applying the patch
+# (must match the pushd targets in scripts/build_mpos.sh).
+_PATCH_WORKDIRS: dict[str, Path] = {
+    "imgfont_set_range.patch":          LVGL_DIR / "lib" / "lvgl",
+    "esp32_uart_repl_runtime.patch":    LVGL_DIR / "lib" / "micropython",
+    "esp32_inisetup_warn_and_format.patch": LVGL_DIR / "lib" / "micropython",
+}
+
+
+def _fix_patch_targets(patch_file: Path, workdir: Path) -> int:
     """
-    Strip Windows carriage returns (\\r) from every .sh file in *directory*.
-    Returns the number of files that were modified.
+    Parse *patch_file* for '+++ b/…' lines and strip CRLF from every
+    file they reference (resolved relative to *workdir*).
+    Patch is applied with -p1, so the leading 'b/' component is stripped.
+    """
+    fixed = 0
+    try:
+        for raw_line in patch_file.read_bytes().split(b"\n"):
+            line = raw_line.rstrip(b"\r").decode("utf-8", errors="replace")
+            if not line.startswith("+++ "):
+                continue
+            path_part = line[4:]                       # drop '+++ '
+            if path_part.startswith("b/"):
+                path_part = path_part[2:]              # strip -p1 prefix
+            elif path_part.startswith("a/"):
+                continue                               # unusual; skip
+            path_part = path_part.split("\t")[0].strip()
+            if path_part in ("/dev/null", ""):
+                continue
+            target = workdir / path_part
+            if target.exists():
+                fixed += _strip_file(target)
+    except OSError:
+        pass
+    return fixed
+
+
+def _fix_crlf(repo_root: Path) -> int:
+    """
+    Strip Windows carriage returns (\\r) from shell scripts, patch files, and
+    the C/H source files those patches target.  Returns the count of files
+    that were actually modified.
 
     This is necessary when the repository lives on a Windows NTFS filesystem
     (e.g. /mnt/c/… in WSL): git on Windows checks out text files with CRLF
-    line endings, which bash cannot execute.  igncr and similar workarounds
-    only work for interactive shells, not for script file execution, so the
-    only reliable fix is to rewrite the files with LF-only endings.
+    line endings.  Shell scripts with CRLF can't be executed by bash; patch
+    files with CRLF cause 'different line endings' hunk failures when their
+    target C files also have CRLF.
     """
     fixed = 0
-    for p in directory.glob("*.sh"):
-        try:
-            raw = p.read_bytes()
-            if b"\r" in raw:
-                p.write_bytes(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
-                fixed += 1
-        except OSError:
-            pass
+
+    # ── Shell scripts ────────────────────────────────────────────────────────
+    for p in (repo_root / "scripts").glob("*.sh"):
+        fixed += _strip_file(p)
+
+    # ── Patch files + their C/H targets ─────────────────────────────────────
+    lvgl_dir = repo_root / "lvgl_micropython"
+    for patch_file in lvgl_dir.glob("*.patch"):
+        fixed += _strip_file(patch_file)
+        workdir = _PATCH_WORKDIRS.get(patch_file.name)
+        if workdir and workdir.is_dir():
+            fixed += _fix_patch_targets(patch_file, workdir)
+
     return fixed
 
 # ─── Build targets / chip types / flash sizes ────────────────────────────────
@@ -528,7 +583,15 @@ class MposTool(App[None]):
     async def _worker_build(self, target: str) -> None:
         self._preflight_crlf()
         t0 = time.monotonic()
+        self._mpy_cross_missing = False
         rc = await self._run(build_command(target))
+        if rc != 0 and self._mpy_cross_missing:
+            self._warn(
+                "mpy-cross was not found — normal on the very first build "
+                "(make.py builds it during compilation). Retrying…"
+            )
+            self._mpy_cross_missing = False
+            rc = await self._run(build_command(target))
         elapsed = time.monotonic() - t0
         if rc == 0:
             self._ok(f"Build finished in {elapsed:.0f}s.")
@@ -551,7 +614,14 @@ class MposTool(App[None]):
         # ── Phase 1: Build ────────────────────────────────────────────
         self._preflight_crlf()
         t0 = time.monotonic()
+        self._mpy_cross_missing = False
         rc = await self._run(build_command(target))
+        if rc != 0 and self._mpy_cross_missing:
+            self._warn(
+                "mpy-cross was not found — normal on the very first build. Retrying…"
+            )
+            self._mpy_cross_missing = False
+            rc = await self._run(build_command(target))
         elapsed = time.monotonic() - t0
         if rc != 0:
             self._error(f"Build failed (exit {rc}) after {elapsed:.0f}s.")
@@ -606,6 +676,10 @@ class MposTool(App[None]):
         async for raw in proc.stdout:
             line = raw.decode("utf-8", errors="replace").rstrip("\n\r")
             log.write(_colorize(line))
+            # Detect first-build mpy-cross absence so workers can auto-retry
+            low = line.lower()
+            if "mpy-cross" in low and ("not found" in low or "no such file" in low):
+                self._mpy_cross_missing = True
             # Parse esptool flash progress  "Writing at 0x… (42 %)"
             m = re.search(r"\((\d+)\s*%\)", line)
             if m:
@@ -680,11 +754,11 @@ class MposTool(App[None]):
     # ── Pre-flight checks ─────────────────────────────────────────────────────
 
     def _preflight_crlf(self) -> None:
-        """Fix CRLF line endings in scripts/ before running a build."""
-        n = _fix_crlf(REPO_ROOT / "scripts")
+        """Fix CRLF line endings in scripts/ and patch targets before a build."""
+        n = _fix_crlf(REPO_ROOT)
         if n:
             self._warn(
-                f"Fixed CRLF→LF in {n} script(s) in scripts/. "
+                f"Fixed CRLF→LF in {n} file(s) (scripts, patches, C sources). "
                 "(Windows filesystem detected — this is a one-time correction.)"
             )
 
