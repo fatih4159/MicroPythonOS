@@ -259,6 +259,17 @@ _TARGET_BIN_TAG: dict[str, str] = {
 _OS = platform.system()   # "Linux" | "Darwin" | "Windows"
 
 
+def _detect_wsl() -> bool:
+    """True when this Python process is running inside WSL."""
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+_WSL = _OS == "Linux" and _detect_wsl()
+
+
 def _is_wsl_available() -> bool:
     if _OS != "Windows":
         return False
@@ -270,6 +281,46 @@ def _is_wsl_available() -> bool:
         return r.returncode == 0 and "ok" in r.stdout
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+
+def _find_windows_python() -> str | None:
+    """
+    When running inside WSL, locate a Windows Python executable that can
+    reach Windows COM ports.  Tries the launchers/executables that WSL
+    exposes from the Windows PATH.
+    """
+    for exe in ("python.exe", "py.exe"):
+        try:
+            r = subprocess.run(
+                [exe, "-c", "import sys; print(sys.version)"],
+                capture_output=True, text=True, timeout=6,
+            )
+            if r.returncode == 0:
+                return exe
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+def _wsl_windows_com_ports() -> list[tuple[str, str]]:
+    """
+    Query Windows for COM ports via PowerShell — usable from inside WSL.
+    Returns [(device, description)] with device = 'COM3', etc.
+    """
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "[System.IO.Ports.SerialPort]::getportnames()"],
+            capture_output=True, text=True, timeout=8,
+        )
+        ports = []
+        for line in r.stdout.splitlines():
+            p = line.strip()
+            if p.upper().startswith("COM"):
+                ports.append((p, f"{p}  (Windows)"))
+        return ports
+    except Exception:
+        return []
 
 
 def _windows_to_wsl(path: Path) -> str:
@@ -299,7 +350,21 @@ def build_command(target: str) -> list[str] | None:
 
 
 def find_serial_ports() -> list[tuple[str, str]]:
-    """Return [(device, description)] for all available serial ports."""
+    """Return [(device, description)] for all available serial ports.
+
+    When running inside WSL, USB serial ports are not forwarded to the WSL
+    network namespace by default.  We therefore also query Windows via
+    PowerShell and return Windows COM ports (e.g. 'COM3') so the user can
+    flash without needing usbipd or a native Windows Python install.
+    """
+    results: list[tuple[str, str]] = []
+
+    if _WSL:
+        # Inside WSL: Linux /dev/ttyUSB* won't have the device unless usbipd
+        # is set up, so skip the native scan and go straight to Windows.
+        results.extend(_wsl_windows_com_ports())
+        return results
+
     if _HAS_SERIAL:
         return [
             (p.device, p.description or p.device)
@@ -558,8 +623,19 @@ class MposTool(App[None]):
     def on_mount(self) -> None:
         self._refresh_ports_and_fw()
         self._info(f"Repo   : {REPO_ROOT}")
-        self._info(f"OS     : {_OS}")
-        if _OS == "Windows" and not _is_wsl_available():
+        self._info(f"OS     : {_OS}{'  (WSL)' if _WSL else ''}")
+        if _WSL:
+            self._info(
+                "Running inside WSL — USB serial ports are sourced from Windows via "
+                "PowerShell.  Flash uses Windows Python (python.exe) automatically."
+            )
+            if _find_windows_python() is None:
+                self._warn(
+                    "Windows Python (python.exe / py.exe) not found in WSL PATH. "
+                    "Flashing will fail.  Install Python for Windows from https://python.org "
+                    "or run this tool directly with Windows Python: python.exe tools\\mpos_tool.py"
+                )
+        elif _OS == "Windows" and not _is_wsl_available():
             self._warn("Building requires WSL — not found.  Flash-only mode active.")
         self._info("Select a target, then press ▶ Build, ⚡ Flash, or ▶⚡ Build + Flash.")
 
@@ -790,11 +866,60 @@ class MposTool(App[None]):
         else:
             flash_addr = "0x0"
 
-        esptool_py = find_esptool_python()
+        port_str = str(port)
+
+        # ── WSL + Windows COM port → use Windows Python for the flash ─────────
+        # WSL2 does not expose USB serial ports inside Linux by default.
+        # When the selected port is a Windows COM port (e.g. COM3) we route
+        # the flash command through Windows Python (python.exe / py.exe) which
+        # can reach COM ports directly.  The firmware path must be converted
+        # to a Windows path so Windows Python can open it.
+        if _WSL and port_str.upper().startswith("COM"):
+            win_py = _find_windows_python()
+            if win_py is None:
+                self._error(
+                    "Flashing via Windows COM port requires Windows Python, but it "
+                    "was not found in the WSL PATH.  Install Python for Windows from "
+                    "https://python.org and re-run, or use 'usbipd' to forward the "
+                    "USB device into WSL."
+                )
+                return 1
+            # Ensure esptool is available in Windows Python
+            try:
+                subprocess.run(
+                    [win_py, "-m", "esptool", "version"],
+                    capture_output=True, timeout=8, check=True,
+                )
+            except Exception:
+                self._warn(
+                    "Installing esptool into Windows Python — this takes a moment…"
+                )
+                try:
+                    subprocess.run(
+                        [win_py, "-m", "pip", "install", "--quiet", "esptool"],
+                        check=True, timeout=120,
+                    )
+                except Exception as exc:
+                    self._error(f"Could not install esptool in Windows Python: {exc}")
+                    return 1
+            # Convert Linux /mnt/c/... path → Windows C:\... path
+            try:
+                r = subprocess.run(
+                    ["wslpath", "-w", fw_path],
+                    capture_output=True, text=True, timeout=5,
+                )
+                win_fw = r.stdout.strip() if r.returncode == 0 else fw_path
+            except Exception:
+                win_fw = fw_path
+            esptool_py = win_py
+            fw_path    = win_fw
+        else:
+            esptool_py = find_esptool_python()
+
         cmd = [
             esptool_py, "-m", "esptool",
             "--chip",   str(chip),
-            "--port",   str(port),
+            "--port",   port_str,
             "--before", "default_reset",
             "--after",  "hard_reset",
             "write_flash",
@@ -804,7 +929,7 @@ class MposTool(App[None]):
             flash_addr, fw_path,
         ]
 
-        self._step(f"Flashing {Path(fw_path).name}  →  {port}")
+        self._step(f"Flashing {Path(fw_path).name}  →  {port_str}")
         self.query_one("#progress", ProgressBar).update(progress=0)
         return await self._run(cmd)
 
