@@ -183,8 +183,13 @@ def build_command(target: str) -> list[str] | None:
     if _is_wsl_available():
         wsl_script = _windows_to_wsl(BUILD_SCRIPT)
         wsl_root   = _windows_to_wsl(REPO_ROOT)
-        return ["wsl.exe", "bash", "-c",
-                f"cd '{wsl_root}' && bash '{wsl_script}' {script_target}"]
+        # Strip Windows CR (\r) before executing — git on Windows checks out
+        # scripts with CRLF line endings which bash inside WSL cannot handle.
+        cmd = (
+            f"cd '{wsl_root}' && "
+            f"bash <(tr -d '\\r' < '{wsl_script}') {script_target}"
+        )
+        return ["wsl.exe", "bash", "-c", cmd]
     return None
 
 
