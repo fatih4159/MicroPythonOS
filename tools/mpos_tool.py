@@ -106,14 +106,24 @@ ESP32_BUILD    = LVGL_DIR / "lib" / "micropython" / "ports" / "esp32"
 # ─── Build targets / chip types / flash sizes ────────────────────────────────
 
 BUILD_TARGETS: list[tuple[str, str]] = [
-    ("ESP32-S3  SPIRAM-OCT  16 MB  [esp32s3]",    "esp32s3"),
-    ("ESP32     SPIRAM      16 MB  [esp32]",       "esp32"),
-    ("ESP32     No-PSRAM     4 MB  [esp32-small]", "esp32-small"),
-    ("unPhone               [unphone]",            "unphone"),
-    ("LilyGO T4             [lilygo_t4]",          "lilygo_t4"),
-    ("Linux desktop         [unix]",               "unix"),
-    ("macOS desktop         [macos]",              "macos"),
+    # ── ESP32-S3 boards ──────────────────────────────────────────────────────
+    ("Spotpear ESP32-S3-N16R8  1.28\" Round LCD",  "spotpear"),
+    ("ESP32-S3  SPIRAM-OCT  16 MB  [generic]",     "esp32s3"),
+    ("unPhone               [unphone]",             "unphone"),
+    # ── ESP32 boards ─────────────────────────────────────────────────────────
+    ("ESP32     SPIRAM      16 MB  [esp32]",        "esp32"),
+    ("ESP32     No-PSRAM     4 MB  [esp32-small]",  "esp32-small"),
+    ("LilyGO T4             [lilygo_t4]",           "lilygo_t4"),
+    # ── Desktop ──────────────────────────────────────────────────────────────
+    ("Linux desktop         [unix]",                "unix"),
+    ("macOS desktop         [macos]",               "macos"),
 ]
+
+# Map TUI target IDs → build_mpos.sh target names
+# (multiple TUI entries can share the same script target)
+_TARGET_SCRIPT_MAP: dict[str, str] = {
+    "spotpear": "esp32s3",   # same binary; board detected at runtime
+}
 
 CHIP_TYPES: list[tuple[str, str]] = [
     ("ESP32-S3  [esp32s3]", "esp32s3"),
@@ -131,6 +141,7 @@ FLASH_SIZES: list[tuple[str, str]] = [
 
 # Target name → substring found in merged binary filenames
 _TARGET_BIN_TAG: dict[str, str] = {
+    "spotpear":   "S3-SPIRAM_OCT",   # same binary as esp32s3
     "esp32s3":    "S3-SPIRAM_OCT",
     "esp32":      "GENERIC-SPIRAM",
     "esp32-small":"GENERIC-4",
@@ -165,13 +176,15 @@ def _windows_to_wsl(path: Path) -> str:
 
 def build_command(target: str) -> list[str] | None:
     """Return the command list to invoke build_mpos.sh, or None if impossible."""
+    # Resolve any TUI-specific alias to the actual script target
+    script_target = _TARGET_SCRIPT_MAP.get(target, target)
     if _OS in ("Linux", "Darwin"):
-        return ["bash", str(BUILD_SCRIPT), target]
+        return ["bash", str(BUILD_SCRIPT), script_target]
     if _is_wsl_available():
         wsl_script = _windows_to_wsl(BUILD_SCRIPT)
         wsl_root   = _windows_to_wsl(REPO_ROOT)
         return ["wsl.exe", "bash", "-c",
-                f"cd '{wsl_root}' && bash '{wsl_script}' {target}"]
+                f"cd '{wsl_root}' && bash '{wsl_script}' {script_target}"]
     return None
 
 
@@ -360,7 +373,11 @@ class MposTool(App[None]):
             with Vertical(id="sidebar"):
                 yield Static("▶  BUILD", classes="section")
                 yield Label("Target")
-                yield Select(BUILD_TARGETS, value="esp32s3", id="build-target")
+                yield Select(
+                    BUILD_TARGETS,
+                    value="spotpear",
+                    id="build-target",
+                )
                 yield Button("▶  Build", id="btn-build", variant="primary")
 
                 yield Rule()
