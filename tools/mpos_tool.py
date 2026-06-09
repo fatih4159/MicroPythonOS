@@ -58,6 +58,7 @@ _bootstrap()
 # ─── Standard library ────────────────────────────────────────────────────────
 
 import asyncio
+import os
 import platform
 import re
 import time
@@ -183,11 +184,11 @@ def build_command(target: str) -> list[str] | None:
     if _is_wsl_available():
         wsl_script = _windows_to_wsl(BUILD_SCRIPT)
         wsl_root   = _windows_to_wsl(REPO_ROOT)
-        # Strip Windows CR (\r) before executing — git on Windows checks out
-        # scripts with CRLF line endings which bash inside WSL cannot handle.
+        # BASHOPTS=igncr is set via the environment (see _run); pass it here
+        # too so the wsl.exe-spawned bash inherits it from the command line.
         cmd = (
             f"cd '{wsl_root}' && "
-            f"bash <(tr -d '\\r' < '{wsl_script}') {script_target}"
+            f"BASHOPTS=igncr bash '{wsl_script}' {script_target}"
         )
         return ["wsl.exe", "bash", "-c", cmd]
     return None
@@ -558,12 +559,19 @@ class MposTool(App[None]):
         log  = self.query_one("#log",      RichLog)
         prog = self.query_one("#progress", ProgressBar)
 
+        # BASHOPTS=igncr makes bash (and every bash child process) silently
+        # ignore \r characters in scripts.  This is essential when the repo
+        # lives on a Windows NTFS filesystem (e.g. accessed via WSL at
+        # /mnt/c/…) where git checks out shell scripts with CRLF line endings.
+        env = {**os.environ, "BASHOPTS": "igncr"}
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=REPO_ROOT,
+                env=env,
             )
         except FileNotFoundError as exc:
             self._error(f"Command not found: {exc}")
