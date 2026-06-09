@@ -104,6 +104,29 @@ LVGL_DIR       = REPO_ROOT / "lvgl_micropython"
 MERGED_BIN_DIR = LVGL_DIR / "build"
 ESP32_BUILD    = LVGL_DIR / "lib" / "micropython" / "ports" / "esp32"
 
+
+def _fix_crlf(directory: Path) -> int:
+    """
+    Strip Windows carriage returns (\\r) from every .sh file in *directory*.
+    Returns the number of files that were modified.
+
+    This is necessary when the repository lives on a Windows NTFS filesystem
+    (e.g. /mnt/c/… in WSL): git on Windows checks out text files with CRLF
+    line endings, which bash cannot execute.  igncr and similar workarounds
+    only work for interactive shells, not for script file execution, so the
+    only reliable fix is to rewrite the files with LF-only endings.
+    """
+    fixed = 0
+    for p in directory.glob("*.sh"):
+        try:
+            raw = p.read_bytes()
+            if b"\r" in raw:
+                p.write_bytes(raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n"))
+                fixed += 1
+        except OSError:
+            pass
+    return fixed
+
 # ─── Build targets / chip types / flash sizes ────────────────────────────────
 
 BUILD_TARGETS: list[tuple[str, str]] = [
@@ -503,6 +526,7 @@ class MposTool(App[None]):
 
     @work(exclusive=True)
     async def _worker_build(self, target: str) -> None:
+        self._preflight_crlf()
         t0 = time.monotonic()
         rc = await self._run(build_command(target))
         elapsed = time.monotonic() - t0
@@ -525,6 +549,7 @@ class MposTool(App[None]):
     @work(exclusive=True)
     async def _worker_build_and_flash(self, target: str) -> None:
         # ── Phase 1: Build ────────────────────────────────────────────
+        self._preflight_crlf()
         t0 = time.monotonic()
         rc = await self._run(build_command(target))
         elapsed = time.monotonic() - t0
@@ -651,6 +676,17 @@ class MposTool(App[None]):
                 if "[merged]" in label:
                     return path
         return files[0][1]
+
+    # ── Pre-flight checks ─────────────────────────────────────────────────────
+
+    def _preflight_crlf(self) -> None:
+        """Fix CRLF line endings in scripts/ before running a build."""
+        n = _fix_crlf(REPO_ROOT / "scripts")
+        if n:
+            self._warn(
+                f"Fixed CRLF→LF in {n} script(s) in scripts/. "
+                "(Windows filesystem detected — this is a one-time correction.)"
+            )
 
     # ── UI helpers ───────────────────────────────────────────────────────────
 
